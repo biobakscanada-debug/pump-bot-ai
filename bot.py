@@ -23,13 +23,13 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🚀 Pump Hunter на Railway — максимальная скорость!"
+    return "🚀 Pump Hunter на Railway — непрерывный режим!"
 
 @app.route('/ping')
 def ping():
     return "pong"
 
-# Константы — агрессивные
+# Константы
 TIMEFRAME = '1h'
 MODEL_FILE = 'catboost_pump_railway.cbm'
 LAST_INDEX_FILE = 'last_pair_index.txt'
@@ -72,15 +72,15 @@ ACTIVE_SIGNALS = []
 
 def fetch_ohlcv(symbol: str, limit: int = 1500):
     try:
-        time.sleep(0.45)  # 0.45 сек — граничный лимит MEXC (\~133 req/min)
+        time.sleep(0.45)  # граничный лимит MEXC (\~133 req/min)
         bars = public_exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
-    except ccxt.RateLimitExceeded as e:
-        print(f"Rate limit hit на {symbol}, ждём 5 сек")
+    except ccxt.RateLimitExceeded:
+        print(f"Rate limit на {symbol}, ждём 5 сек")
         time.sleep(5)
-        return fetch_ohlcv(symbol, limit)  # ретрай
+        return fetch_ohlcv(symbol, limit)
     except Exception as e:
         print(f"Ошибка загрузки {symbol}: {e}")
         return pd.DataFrame()
@@ -172,110 +172,40 @@ def load_or_train_model():
     return model
 
 
-def get_funding_rate(symbol):
-    try:
-        funding = private_exchange.fetch_funding_rate(symbol)
-        return funding.get('fundingRate', 0) * 100
-    except Exception as e:
-        print(f"Funding ошибка: {e}")
-        return 0.0
-
-
-def send_funding_update(pair, funding_rate):
-    sign = "📈" if funding_rate > 0 else "📉"
-    text = f"📊 Фандинг {pair}\n{sign} {funding_rate:.4f}%\n"
-    if funding_rate > 0.015:
-        text += "⚠️ Вы платите — может сожрать прибыль!"
-    elif funding_rate < -0.01:
-        text += "✅ Вам капает — держим!"
-    else:
-        text += "Нейтральный."
-    bot.send_message(CHAT_ID, text)
-
-
-def send_signal(pair: str, price: float, prob: float, vol_m: float, change: float, atr: float):
-    df = fetch_ohlcv(pair)
-    if df.empty: return
-    df = add_features(df)
-    if df.empty: return
-    row = df.iloc[-1]
-
-    if row['volume_ratio'] < VOLUME_SURGE or row['price_change'] < PRICE_BREAK or not (RSI_MIN < row['rsi'] < RSI_MAX):
-        print(f"  Пропуск {pair} (prob={prob:.4f})")
-        return
-
-    stop_price = round(price - atr * ATR_MULTIPLIER, 8)
-    stop_percent = ((price - stop_price) / price) * 100
-
-    text = f"""🟢 {pair.split('USDT')[0]} 🚀 ПАМП!
-prob = {prob:.4f} | цена = {price:.8f} | объём x{row['volume_ratio']:.1f}
-RSI = {row['rsi']:.1f} | импульс = {change*100:.2f}%
-
-LONG MEXC Futures
-Цель 1: {round(price * 1.08, 8):.8f}
-Цель 2: {round(price * 1.15, 8):.8f}
-Стоп-лосс: {stop_price:.8f} (-{stop_percent:.2f}%, {ATR_MULTIPLIER}×ATR)"""
-
-    buf = create_chart(pair, price)
-
-    try:
-        bot.send_photo(chat_id=CHAT_ID, photo=buf, caption=text)
-        print(f"🚀 СИГНАЛ → {pair}")
-        ACTIVE_SIGNALS.append({'pair': pair, 'entry_price': price, 'timestamp': time.time()})
-    except Exception as e:
-        print(f"Ошибка отправки {pair}: {e}")
-
-
-def create_chart(pair: str, entry_price: float):
-    df = fetch_ohlcv(pair)
-    if df.empty: return None
-    df = add_features(df)
-    if df.empty: return None
-
-    tp1 = round(entry_price * 1.08, 6)
-    tp2 = round(entry_price * 1.15, 6)
-    atr = df['atr'].iloc[-1]
-    stop = round(entry_price - atr * ATR_MULTIPLIER, 6)
-
-    fig, ax = plt.subplots(figsize=(10, 6), facecolor='#0d1117')
-    ax.plot(df['timestamp'], df['close'], color='#00ff9d', linewidth=2)
-    ax.axhline(entry_price, color='white', linestyle='--', label='Вход')
-    ax.axhline(tp1, color='#00ff00', label='Цель 1')
-    ax.axhline(tp2, color='#00cc00', label='Цель 2')
-    ax.axhline(stop, color='red', linestyle='--', label=f'Стоп ({ATR_MULTIPLIER}×ATR)')
-
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %H:%M'))
-    plt.xticks(rotation=45)
-    ax.grid(True, alpha=0.15)
-    ax.set_title(f'{pair} — ПАМП', color='white')
-    ax.legend(loc='upper left')
-    ax.tick_params(colors='white')
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', facecolor='#0d1117', bbox_inches='tight', dpi=130)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-
 def update_pairs_list():
     global PAIRS
-    try:
-        markets = public_exchange.load_markets(reload=True)
-        futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
-        PAIRS[:] = sorted(futures_pairs, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
-        print(f"Обновлён список: {len(PAIRS)} пар")
-    except Exception as e:
-        print(f"Ошибка обновления пар: {e}")
+    for attempt in range(3):
+        try:
+            print(f"Попытка {attempt+1}/3 обновления списка пар...")
+            markets = public_exchange.load_markets(reload=True)
+            futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
+            new_pairs = sorted(futures_pairs, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
+            print(f"Загружено новых пар: {len(new_pairs)}")
+            if len(new_pairs) > 0:
+                old_len = len(PAIRS)
+                PAIRS[:] = new_pairs
+                print(f"Список обновлён: {len(PAIRS)} пар (было {old_len})")
+                return
+            else:
+                print("Список пуст, ждём 5 сек...")
+                time.sleep(5)
+        except Exception as e:
+            print(f"Ошибка {attempt+1}/3: {type(e).__name__} — {str(e)}")
+            time.sleep(5)
+    print("Все попытки провалились. Продолжаем со старым списком (если был).")
 
 
 def load_last_index():
     if os.path.exists(LAST_INDEX_FILE):
         try:
             with open(LAST_INDEX_FILE, 'r') as f:
-                return int(f.read().strip())
+                idx = int(f.read().strip())
+                print(f"Загружен индекс: {idx}")
+                return idx
         except:
+            print("Ошибка чтения индекса, начинаем с 0")
             return 0
+    print("Файл индекса не найден, начинаем с 0")
     return 0
 
 
@@ -283,6 +213,7 @@ def save_last_index(idx):
     try:
         with open(LAST_INDEX_FILE, 'w') as f:
             f.write(str(idx))
+        print(f"Сохранён индекс: {idx}")
     except Exception as e:
         print(f"Ошибка сохранения индекса: {e}")
 
@@ -331,7 +262,21 @@ def main_loop():
         update_pairs_list()
         check_expired_signals()
 
+        if len(PAIRS) == 0:
+            print("Список пар пуст! Пытаемся обновить...")
+            update_pairs_list()
+            if len(PAIRS) == 0:
+                print("Обновление не удалось. Ждём 60 сек и пробуем снова.")
+                time.sleep(60)
+                continue
+
         start_idx = load_last_index()
+        # Защита: если индекс больше длины списка — сбрасываем на 0
+        if start_idx >= len(PAIRS):
+            print(f"Индекс {start_idx} > длины списка {len(PAIRS)} — сбрасываем на 0")
+            start_idx = 0
+            save_last_index(0)
+
         print(f"[{now_str}] Продолжаем с индекса {start_idx}")
 
         scanned = 0
@@ -359,8 +304,11 @@ def main_loop():
                 if prob > HIGH_PROB_NOTIFY_THRESHOLD:
                     high_prob_count += 1
                     msg = f"🔥 Высокая вероятность: {pair}\nprob = {prob:.4f}\nRSI = {row['rsi']:.1f}\nv_ratio = {row['volume_ratio']:.1f}"
-                    bot.send_message(CHAT_ID, msg)
-                    print(f"  Уведомление: {pair}")
+                    try:
+                        bot.send_message(CHAT_ID, msg)
+                        print(f"  Уведомление: {pair}")
+                    except Exception as e:
+                        print(f"  Ошибка уведомления {pair}: {e}")
 
                 prob_list.append((pair, prob, row['rsi'], row['volume_ratio']))
 
@@ -378,15 +326,18 @@ def main_loop():
             current_idx = start_idx + i + 1
             save_last_index(current_idx)
 
-            time.sleep(0.45)  # граничный лимит, без него может забанить
+            time.sleep(0.45)
 
         if prob_list and iteration % 3 == 0:
             top5 = sorted(prob_list, key=lambda x: x[1], reverse=True)[:5]
             top_text = f"Топ-5 за итерацию {iteration}:\n"
             for pair, prob, rsi, vratio in top5:
                 top_text += f"{pair}: prob={prob:.4f} | RSI={rsi:.1f} | v_ratio={vratio:.1f}\n"
-            bot.send_message(CHAT_ID, top_text)
-            print("Топ-5 отправлен")
+            try:
+                bot.send_message(CHAT_ID, top_text)
+                print("Топ-5 отправлен")
+            except:
+                print("Ошибка отправки топ-5")
 
         print(f"[{now_str}] Итерация завершена | просканировано {scanned} | уведомлений: {high_prob_count} → сразу следующая")
 
@@ -398,8 +349,6 @@ def main_loop():
                 except:
                     pass
             last_funding_check = time.time()
-
-        # НЕТ time.sleep — непрерывный цикл
 
 
 if __name__ == '__main__':

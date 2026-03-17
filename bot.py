@@ -74,7 +74,7 @@ private_exchange = ccxt.mexc({
 })
 
 PAIRS = []
-ACTIVE_SIGNALS = []  # [{'pair': 'PEPEUSDT', 'entry_price': 0.00001, 'timestamp': time.time(), 'atr': 0.000001, 'status': 'open'}]
+ACTIVE_SIGNALS = []  # для отслеживания открытых сигналов
 
 
 def fetch_ohlcv(symbol: str, limit: int = 1500):
@@ -126,19 +126,23 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_or_train_model():
     if os.path.exists(MODEL_FILE):
-        print("Загружаем модель...")
+        print("Загружаем существующую модель...")
         model = CatBoostClassifier()
         model.load_model(MODEL_FILE)
         return model
 
     if not os.path.exists(DATASET_FILE):
-        print(f"Файл {DATASET_FILE} не найден! Обучение невозможно.")
+        print(f"Файл датасета {DATASET_FILE} не найден! Обучение невозможно.")
         return None
 
     print(f"Загружаем датасет из {DATASET_FILE}...")
-    df_all = pd.read_csv(DATASET_FILE)
-    if df_all.empty:
-        print("Датасет пуст!")
+    try:
+        df_all = pd.read_csv(DATASET_FILE)
+        if df_all.empty:
+            print("Датасет пуст!")
+            return None
+    except Exception as e:
+        print(f"Ошибка чтения датасета: {e}")
         return None
 
     X = df_all[FEATURES]
@@ -149,111 +153,85 @@ def load_or_train_model():
     model.fit(X_tr, y_tr)
 
     acc = accuracy_score(y_te, model.predict(X_te))
-    print(f"Модель обучена на реальном датасете | Accuracy: {acc:.4f} ({acc*100:.2f}%) | Строк: {len(df_all)}")
+    print(f"Модель обучена | Accuracy: {acc:.4f} ({acc*100:.2f}%) | Строк: {len(df_all)}")
 
     model.save_model(MODEL_FILE)
     return model
 
 
-def log_signal(signal_data):
-    file_exists = os.path.exists(SIGNALS_LOG)
-    with open(SIGNALS_LOG, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=signal_data.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(signal_data)
+def update_pairs_list():
+    global PAIRS
+    for attempt in range(3):
+        try:
+            print(f"Попытка {attempt+1}/3 обновления списка пар...")
+            markets = public_exchange.load_markets(reload=True)
+            futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
+            new_pairs = sorted(futures_pairs, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
+            print(f"Загружено новых пар: {len(new_pairs)}")
+            if len(new_pairs) > 0:
+                PAIRS[:] = new_pairs
+                print(f"Список обновлён: {len(PAIRS)} пар")
+                return
+            else:
+                print("Список пуст, ждём 5 сек...")
+                time.sleep(5)
+        except Exception as e:
+            print(f"Ошибка {attempt+1}/3: {type(e).__name__} — {str(e)}")
+            time.sleep(5)
+    print("Все попытки провалились. Продолжаем со старым списком (если был).")
 
 
-def check_signals_status():
+def load_last_index():
+    if os.path.exists(LAST_INDEX_FILE):
+        try:
+            with open(LAST_INDEX_FILE, 'r') as f:
+                idx = int(f.read().strip())
+                print(f"Загружен индекс: {idx}")
+                return idx
+        except:
+            print("Ошибка чтения индекса, начинаем с 0")
+            return 0
+    print("Файл индекса не найден, начинаем с 0")
+    return 0
+
+
+def save_last_index(idx):
+    try:
+        with open(LAST_INDEX_FILE, 'w') as f:
+            f.write(str(idx))
+        print(f"Сохранён индекс: {idx}")
+    except Exception as e:
+        print(f"Ошибка сохранения индекса: {e}")
+
+
+def check_expired_signals():
+    global ACTIVE_SIGNALS
     now = time.time()
     to_remove = []
-    report = []
-
     for s in ACTIVE_SIGNALS:
-        pair = s['pair']
-        entry = s['entry_price']
-        atr = s['atr']
-        status = s.get('status', 'open')
-        tp1_hit = s.get('tp1_hit', False)
-
-        try:
-            price, _, _ = get_market_data(pair)
-            if price <= 0:
-                continue
-
-            # TP1
-            if not tp1_hit and price >= entry * TP1_LEVEL:
-                s['tp1_hit'] = True
-                s['trail_sl'] = entry * TRAIL_AFTER_TP1
-                report.append(f"TP1 достигнут: {pair} | {price:.8f}")
-
-            # TP2
-            if price >= entry * TP2_LEVEL:
-                report.append(f"TP2 достигнут: {pair} | {price:.8f}")
-                to_remove.append(s)
-                continue
-
-            # SL или trailing SL
-            current_sl = s['trail_sl'] if tp1_hit else (entry - atr * ATR_MULTIPLIER)
-            if price <= current_sl:
-                report.append(f"SL сработал: {pair} | {price:.8f}")
-                to_remove.append(s)
-                continue
-
-            # Время жизни сигнала
-            if now - s['timestamp'] > SIGNAL_LIFETIME:
-                report.append(f"Тайм-аут: {pair} | {price:.8f}")
-                to_remove.append(s)
-                continue
-
-        except Exception as e:
-            print(f"Ошибка проверки {pair}: {e}")
-
-    for s in to_remove:
-        ACTIVE_SIGNALS.remove(s)
-
-    if report:
-        bot.send_message(CHAT_ID, "\n".join(report))
+        if now - s['timestamp'] > SIGNAL_LIFETIME:
+            try:
+                price, _, _ = get_market_data(s['pair'])
+                msg = f"✅ {s['pair']} отработал!" if price > s['entry_price'] else f"⚠️ {s['pair']} тайм-аут"
+                bot.send_message(CHAT_ID, msg)
+            except:
+                pass
+            to_remove.append(s)
+    ACTIVE_SIGNALS = [s for s in ACTIVE_SIGNALS if s not in to_remove]
 
 
-def daily_report():
-    global last_report_time
-    now = time.time()
-    if now - last_report_time < 86400:  # 24 часа
-        return
-
-    if not os.path.exists(SIGNALS_LOG):
-        return
-
-    df = pd.read_csv(SIGNALS_LOG)
-    if df.empty:
-        return
-
-    # Простая статистика (можно расширить)
-    total = len(df)
-    tp_hit = len(df[df['status'] == 'tp_hit'])
-    sl_hit = len(df[df['status'] == 'sl_hit'])
-    timeout = len(df[df['status'] == 'timeout'])
-    winrate = tp_hit / total * 100 if total > 0 else 0
-
-    text = f"""📊 Ежедневный отчёт
-Всего сигналов: {total}
-TP достигнуто: {tp_hit} ({winrate:.1f}%)
-SL сработал: {sl_hit}
-Тайм-аут: {timeout}
-Активных сигналов: {len(ACTIVE_SIGNALS)}"""
-
-    bot.send_message(CHAT_ID, text)
-    last_report_time = now
-
-
-last_report_time = time.time()
+def get_market_data(symbol):
+    try:
+        ticker = public_exchange.fetch_ticker(symbol)
+        return ticker['last'], ticker.get('percentage', 0), round(ticker.get('quoteVolume', 0) / 1_000_000, 1)
+    except:
+        return 0.0, 0.0, 0.0
 
 
 def main_loop():
     model = load_or_train_model()
     if model is None:
-        print("Модель не загружена")
+        print("Модель не загружена — работаем без модели")
     else:
         print("Модель готова")
 
@@ -269,19 +247,22 @@ def main_loop():
 
         update_pairs_list()
         check_expired_signals()
-        check_signals_status()
-        daily_report()
 
         if len(PAIRS) == 0:
-            print("Пар нет, пробуем обновить...")
+            print("Список пар пуст! Пытаемся обновить...")
             update_pairs_list()
-            time.sleep(60)
-            continue
+            if len(PAIRS) == 0:
+                print("Обновление не удалось. Ждём 60 сек и пробуем снова.")
+                time.sleep(60)
+                continue
 
         start_idx = load_last_index()
         if start_idx >= len(PAIRS):
+            print(f"Индекс {start_idx} > длины списка {len(PAIRS)} — сбрасываем на 0")
             start_idx = 0
             save_last_index(0)
+
+        print(f"[{now_str}] Продолжаем с индекса {start_idx}")
 
         scanned = 0
         high_prob_count = 0
@@ -292,9 +273,11 @@ def main_loop():
             try:
                 df = fetch_ohlcv(pair)
                 if len(df) < MIN_DATA_LENGTH:
+                    print(f"  {pair:20} → мало данных")
                     continue
                 df = add_features(df)
                 if df.empty:
+                    print(f"  {pair:20} → фичи не посчитались")
                     continue
 
                 row = df.iloc[-1]
@@ -306,7 +289,11 @@ def main_loop():
                 if prob > HIGH_PROB_NOTIFY_THRESHOLD:
                     high_prob_count += 1
                     msg = f"🔥 Высокая вероятность: {pair}\nprob = {prob:.4f}\nRSI = {row['rsi']:.1f}\nv_ratio = {row['volume_ratio']:.1f}"
-                    bot.send_message(CHAT_ID, msg)
+                    try:
+                        bot.send_message(CHAT_ID, msg)
+                        print(f"  Уведомление: {pair}")
+                    except Exception as e:
+                        print(f"  Ошибка уведомления {pair}: {e}")
 
                 prob_list.append((pair, prob, row['rsi'], row['volume_ratio']))
 
@@ -314,18 +301,6 @@ def main_loop():
                     price, _, vm = get_market_data(pair)
                     atr = row['atr']
                     send_signal(pair, price, prob, vm, row['price_change'], atr)
-
-                    # Логируем сигнал
-                    log_signal({
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'pair': pair,
-                        'entry_price': price,
-                        'prob': prob,
-                        'rsi': row['rsi'],
-                        'v_ratio': row['volume_ratio'],
-                        'atr': atr,
-                        'status': 'open'
-                    })
 
             except Exception as e:
                 print(f"  {pair} → ошибка: {type(e).__name__}")
@@ -343,7 +318,11 @@ def main_loop():
             top_text = f"Топ-5 за итерацию {iteration}:\n"
             for pair, prob, rsi, vratio in top5:
                 top_text += f"{pair}: prob={prob:.4f} | RSI={rsi:.1f} | v_ratio={vratio:.1f}\n"
-            bot.send_message(CHAT_ID, top_text)
+            try:
+                bot.send_message(CHAT_ID, top_text)
+                print("Топ-5 отправлен")
+            except:
+                print("Ошибка отправки топ-5")
 
         print(f"[{now_str}] Итерация завершена | просканировано {scanned} | уведомлений: {high_prob_count} → сразу следующая")
 

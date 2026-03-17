@@ -1,0 +1,11 @@
+ccxt
+pandas
+numpy
+matplotlib
+python-telegram-bot==13.7
+catboost
+scikit-learn
+flask
+gunicorn
+urllib3==1.26.18
+requests

@@ -3,6 +3,7 @@ import time
 import io
 import threading
 from datetime import datetime
+import requests
 
 import ccxt
 import pandas as pd
@@ -29,7 +30,9 @@ def home():
 def ping():
     return "pong"
 
-# Константы — агрессивные
+# ────────────────────────────────────────────────
+# Константы
+# ────────────────────────────────────────────────
 TIMEFRAME = '1h'
 INTERVAL_SECONDS = 600
 MODEL_FILE = 'catboost_pump_railway.cbm'
@@ -70,9 +73,12 @@ PAIRS = []
 ACTIVE_SIGNALS = []
 
 
+# ────────────────────────────────────────────────
+# Данные и фичи
+# ────────────────────────────────────────────────
 def fetch_ohlcv(symbol: str, limit: int = 1500):
     try:
-        time.sleep(0.5)  # уменьшил до 0.5 для Railway
+        time.sleep(0.4)
         bars = public_exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -108,22 +114,27 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 
+# ────────────────────────────────────────────────
+# Модель — 40 свежих пампов (правильные символы MEXC)
+# ────────────────────────────────────────────────
 def load_or_train_model():
     if os.path.exists(MODEL_FILE):
+        print("Загружаем существующую модель...")
         model = CatBoostClassifier()
         model.load_model(MODEL_FILE)
         return model
 
-    print("Обучение модели...")
+    print("Обучение модели на 40 свежих пампах...")
+    
     training_pairs = [
-        'PEPE/USDT:USDT', 'WIF/USDT:USDT', 'BONK/USDT:USDT', 'POPCAT/USDT:USDT', 'BRETT/USDT:USDT',
-        'FARTCOIN/USDT:USDT', 'GOAT/USDT:USDT', 'MOODENG/USDT:USDT', 'NEIRO/USDT:USDT', 'TRUMP/USDT:USDT',
-        'SOL/USDT:USDT', 'DOGE/USDT:USDT', 'SHIB/USDT:USDT', 'FLOKI/USDT:USDT', '1000BONK/USDT:USDT',
-        'MEW/USDT:USDT', 'MOG/USDT:USDT', 'GIGA/USDT:USDT', 'PNUT/USDT:USDT', 'ACT/USDT:USDT',
-        'TURBO/USDT:USDT', 'MIGGLES/USDT:USDT', 'TOSHI/USDT:USDT', 'BOME/USDT:USDT', 'SLERF/USDT:USDT',
-        'FWOG/USDT:USDT', 'RETARDIO/USDT:USDT', 'LOCKIN/USDT:USDT', 'MOTHER/USDT:USDT', 'AURA/USDT:USDT',
-        'DEGEN/USDT:USDT', 'HIGHER/USDT:USDT', 'BOBO/USDT:USDT', 'MUMU/USDT:USDT', 'KENDU/USDT:USDT',
-        'CHEEMS/USDT:USDT', 'SAMO/USDT:USDT', 'KOKO/USDT:USDT', 'SELFIE/USDT:USDT', 'BILLY/USDT:USDT'
+        'PEPEUSDT', 'WIFUSDT', 'BONKUSDT', 'POPCATUSDT', 'BRETTUSDT',
+        'FARTCOINUSDT', 'GOATUSDT', 'MOODENGUSDT', 'NEIROUSDT', 'TRUMPUSDT',
+        'SOLUSDT', 'DOGEUSDT', 'SHIBUSDT', 'FLOKIUSDT', '1000BONKUSDT',
+        'MEWUSDT', 'MOGUSDT', 'GIGAUSDT', 'PNUTUSDT', 'ACTUSDT',
+        'TURBOUSDT', 'MIGGLESUSDT', 'TOSHIUSDT', 'BOMEUSDT', 'SLERFUSDT',
+        'FWOGUSDT', 'RETARDIOUSDT', 'LOCKINUSDT', 'MOTHERUSDT', 'AURAUSDT',
+        'DEGENUSDT', 'HIGHERUSDT', 'BOBOUSDT', 'MUMUUSDT', 'KENDUUSDT',
+        'CHEEMSUSDT', 'SAMOUSDT', 'KOKOUSDT', 'SELFIEUSDT', 'BILLYUSDT'
     ]
 
     all_data = []
@@ -131,9 +142,13 @@ def load_or_train_model():
         try:
             time.sleep(2)
             df = fetch_ohlcv(symbol)
-            if df.empty: continue
+            if df.empty:
+                print(f"  {symbol} — пустой датафрейм, пропускаем")
+                continue
             df = add_features(df)
-            if df.empty: continue
+            if df.empty:
+                print(f"  {symbol} — фичи не посчитались, пропускаем")
+                continue
             df['target'] = (df['price_change'].shift(-1) > 0.018).astype(int)
             all_data.append(df)
         except Exception as e:
@@ -141,7 +156,9 @@ def load_or_train_model():
             continue
 
     if not all_data:
-        raise ValueError("Нет данных для обучения!")
+        print("ВНИМАНИЕ: Нет данных для обучения! Модель не будет создана.")
+        # Чтобы не падать — возвращаем None или пустую модель
+        return None
 
     df_all = pd.concat(all_data).dropna()
     X = df_all[FEATURES]
@@ -150,6 +167,11 @@ def load_or_train_model():
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     model = CatBoostClassifier(iterations=1200, depth=8, learning_rate=0.04, verbose=0)
     model.fit(X_tr, y_tr)
+    
+    # Выводим accuracy
+    acc = accuracy_score(y_te, model.predict(X_te))
+    print(f"Модель обучена | Accuracy на тесте: {acc:.4f} ({acc*100:.2f}%)")
+    
     model.save_model(MODEL_FILE)
     return model
 
@@ -159,7 +181,7 @@ def get_funding_rate(symbol):
         funding = private_exchange.fetch_funding_rate(symbol)
         return funding.get('fundingRate', 0) * 100
     except Exception as e:
-        print(f"Funding ошибка: {e}")
+        print(f"Funding ошибка для {symbol}: {e}")
         return 0.0
 
 
@@ -167,12 +189,15 @@ def send_funding_update(pair, funding_rate):
     sign = "📈" if funding_rate > 0 else "📉"
     text = f"📊 Фандинг {pair}\n{sign} {funding_rate:.4f}%\n"
     if funding_rate > 0.015:
-        text += "⚠️ Вы платите — может сожрать прибыль!"
+        text += "⚠️ Вы платите за финансирование — может сожрать прибыль!"
     elif funding_rate < -0.01:
-        text += "✅ Вам капает — держим!"
+        text += "✅ Вам капает фандинг — держим позицию!"
     else:
-        text += "Нейтральный."
-    bot.send_message(CHAT_ID, text)
+        text += "Фандинг нейтральный."
+    try:
+        bot.send_message(CHAT_ID, text)
+    except:
+        pass
 
 
 def send_signal(pair: str, price: float, prob: float, vol_m: float, change: float):
@@ -183,14 +208,14 @@ def send_signal(pair: str, price: float, prob: float, vol_m: float, change: floa
     row = df.iloc[-1]
 
     if row['volume_ratio'] < VOLUME_SURGE or row['price_change'] < PRICE_BREAK or not (RSI_MIN < row['rsi'] < RSI_MAX):
-        print(f"  Пропуск {pair} (prob={prob:.4f})")
+        print(f"  Пропуск {pair} (prob={prob:.4f}) — не подтверждён памп")
         return
 
-    text = f"""🟢 {pair.split('/')[0]} 🚀 ПАМП!
+    text = f"""🟢 {pair.split('USDT')[0]} 🚀 Подтверждённый памп!
 prob = {prob:.4f} | цена = {price:.8f} | объём x{row['volume_ratio']:.1f}
 RSI = {row['rsi']:.1f} | импульс = {change*100:.2f}%
 
-LONG MEXC Futures
+LONG на MEXC Futures
 Цель 1: {round(price * 1.08, 8):.8f}
 Цель 2: {round(price * 1.15, 8):.8f}
 Стоп: {round(price * 0.94, 8):.8f} (-6%)"""
@@ -199,7 +224,7 @@ LONG MEXC Futures
 
     try:
         bot.send_photo(chat_id=CHAT_ID, photo=buf, caption=text)
-        print(f"🚀 СИГНАЛ → {pair}")
+        print(f"🚀 СИГНАЛ ОТПРАВЛЕН → {pair}")
         ACTIVE_SIGNALS.append({'pair': pair, 'entry_price': price, 'timestamp': time.time()})
     except Exception as e:
         print(f"Ошибка отправки {pair}: {e}")
@@ -291,6 +316,10 @@ def get_market_data(symbol):
 
 def main_loop():
     model = load_or_train_model()
+    if model is None:
+        print("Модель не обучена — бот будет работать без модели")
+    else:
+        print("Модель готова к работе")
 
     bot.send_message(CHAT_ID, f"🚀 Pump Hunter запущен на Railway | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -326,15 +355,18 @@ def main_loop():
 
                 row = df.iloc[-1]
                 feats = row[FEATURES].values.reshape(1, -1)
-                prob = model.predict_proba(feats)[0][1]
+                prob = model.predict_proba(feats)[0][1] if model is not None else 0.0
 
                 print(f"  {pair:20} → prob={prob:.4f} | RSI={row['rsi']:.1f} | v_ratio={row['volume_ratio']:.1f}")
 
                 if prob > HIGH_PROB_NOTIFY_THRESHOLD:
                     high_prob_count += 1
-                    msg = f"🔥 Высокая вероятность: {pair}\nprob = {prob:.4f}\nRSI = {row['rsi']:.1f}\nv_ratio = {row['volume_ratio']:.1f}"
-                    bot.send_message(CHAT_ID, msg)
-                    print(f"  Уведомление: {pair}")
+                    msg = f"🔥 Высокая вероятность (без фильтра): {pair}\nprob = {prob:.4f}\nRSI = {row['rsi']:.1f}\nv_ratio = {row['volume_ratio']:.1f}"
+                    try:
+                        bot.send_message(CHAT_ID, msg)
+                        print(f"  Уведомление отправлено: {pair}")
+                    except Exception as e:
+                        print(f"  Ошибка уведомления {pair}: {e}")
 
                 prob_list.append((pair, prob, row['rsi'], row['volume_ratio']))
 
@@ -346,20 +378,23 @@ def main_loop():
                 print(f"  {pair} → ошибка: {type(e).__name__}")
 
             if scanned % 50 == 0:
-                print(f"  Прогресс: {scanned}/{len(PAIRS)} | {pair}")
+                print(f"  Прогресс: обработано {scanned} пар из {len(PAIRS)} | последняя {pair}")
 
             current_idx = start_idx + i + 1
             save_last_index(current_idx)
 
-            time.sleep(0.5)  # быстро, Railway позволяет
+            time.sleep(0.4)
 
         if prob_list and iteration % 3 == 0:
             top5 = sorted(prob_list, key=lambda x: x[1], reverse=True)[:5]
-            top_text = f"Топ-5 за итерацию {iteration}:\n"
+            top_text = f"Топ-5 вероятностей за итерацию {iteration}:\n"
             for pair, prob, rsi, vratio in top5:
                 top_text += f"{pair}: prob={prob:.4f} | RSI={rsi:.1f} | v_ratio={vratio:.1f}\n"
-            bot.send_message(CHAT_ID, top_text)
-            print("Топ-5 отправлен")
+            try:
+                bot.send_message(CHAT_ID, top_text)
+                print("Топ-5 отправлен в Telegram")
+            except:
+                print("Ошибка отправки топ-5")
 
         print(f"[{now_str}] Итерация завершена | просканировано {scanned} | уведомлений: {high_prob_count}")
 
@@ -379,5 +414,5 @@ if __name__ == '__main__':
     update_pairs_list()
     threading.Thread(target=main_loop, daemon=True).start()
 
-    port = int(os.getenv("PORT", 8080))  # Railway требует PORT
+    port = int(os.getenv("PORT", 8080))
     app.run(host='0.0.0.0', port=port)

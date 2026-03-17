@@ -23,15 +23,14 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🚀 Pump Hunter на Railway работает!"
+    return "🚀 Pump Hunter на Railway — максимальная скорость!"
 
 @app.route('/ping')
 def ping():
     return "pong"
 
-# Константы
+# Константы — агрессивные
 TIMEFRAME = '1h'
-INTERVAL_SECONDS = 600
 MODEL_FILE = 'catboost_pump_railway.cbm'
 LAST_INDEX_FILE = 'last_pair_index.txt'
 
@@ -44,7 +43,7 @@ VOLUME_SURGE = 1.2
 PRICE_BREAK = 0.005
 RSI_MIN = 40
 RSI_MAX = 90
-ATR_MULTIPLIER = 1.5  # стоп-лосс = цена - ATR * 1.5
+ATR_MULTIPLIER = 1.5
 
 FEATURES = ['ema200', 'rsi', 'macd', 'bb_width', 'price_change', 'volume_change', 'volume_ratio']
 
@@ -73,11 +72,15 @@ ACTIVE_SIGNALS = []
 
 def fetch_ohlcv(symbol: str, limit: int = 1500):
     try:
-        time.sleep(0.4)
+        time.sleep(0.45)  # 0.45 сек — граничный лимит MEXC (\~133 req/min)
         bars = public_exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
+    except ccxt.RateLimitExceeded as e:
+        print(f"Rate limit hit на {symbol}, ждём 5 сек")
+        time.sleep(5)
+        return fetch_ohlcv(symbol, limit)  # ретрай
     except Exception as e:
         print(f"Ошибка загрузки {symbol}: {e}")
         return pd.DataFrame()
@@ -106,7 +109,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df['volume_change'] = df['volume'].pct_change()
     df['volume_ratio'] = df['volume'] / df['volume'].rolling(25).mean()
 
-    # ATR для динамического стопа
     df['tr'] = np.maximum(df['high'] - df['low'], 
                           np.maximum(abs(df['high'] - df['close'].shift()), 
                                      abs(df['low'] - df['close'].shift())))
@@ -122,7 +124,7 @@ def load_or_train_model():
         model.load_model(MODEL_FILE)
         return model
 
-    print("Обучение модели на реальных пампах MEXC...")
+    print("Обучение модели...")
     
     training_pairs = [
         'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
@@ -152,7 +154,7 @@ def load_or_train_model():
             continue
 
     if not all_data:
-        print("ВНИМАНИЕ: Нет данных для обучения! Бот продолжит без модели.")
+        print("ВНИМАНИЕ: Нет данных для обучения!")
         return None
 
     df_all = pd.concat(all_data).dropna()
@@ -202,15 +204,14 @@ def send_signal(pair: str, price: float, prob: float, vol_m: float, change: floa
         print(f"  Пропуск {pair} (prob={prob:.4f})")
         return
 
-    # Динамический стоп на основе ATR
     stop_price = round(price - atr * ATR_MULTIPLIER, 8)
     stop_percent = ((price - stop_price) / price) * 100
 
-    text = f"""🟢 {pair.split('USDT')[0]} 🚀 Подтверждённый памп!
+    text = f"""🟢 {pair.split('USDT')[0]} 🚀 ПАМП!
 prob = {prob:.4f} | цена = {price:.8f} | объём x{row['volume_ratio']:.1f}
 RSI = {row['rsi']:.1f} | импульс = {change*100:.2f}%
 
-LONG на MEXC Futures
+LONG MEXC Futures
 Цель 1: {round(price * 1.08, 8):.8f}
 Цель 2: {round(price * 1.15, 8):.8f}
 Стоп-лосс: {stop_price:.8f} (-{stop_percent:.2f}%, {ATR_MULTIPLIER}×ATR)"""
@@ -219,7 +220,7 @@ LONG на MEXC Futures
 
     try:
         bot.send_photo(chat_id=CHAT_ID, photo=buf, caption=text)
-        print(f"🚀 СИГНАЛ ОТПРАВЛЕН → {pair}")
+        print(f"🚀 СИГНАЛ → {pair}")
         ACTIVE_SIGNALS.append({'pair': pair, 'entry_price': price, 'timestamp': time.time()})
     except Exception as e:
         print(f"Ошибка отправки {pair}: {e}")
@@ -313,11 +314,11 @@ def get_market_data(symbol):
 def main_loop():
     model = load_or_train_model()
     if model is None:
-        print("Модель не обучена — бот работает без модели")
+        print("Модель не обучена — работаем без модели")
     else:
         print("Модель готова")
 
-    bot.send_message(CHAT_ID, f"🚀 Pump Hunter запущен на Railway | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    bot.send_message(CHAT_ID, f"🚀 Pump Hunter запущен на Railway — непрерывный режим | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     iteration = 0
     last_funding_check = time.time()
@@ -377,7 +378,7 @@ def main_loop():
             current_idx = start_idx + i + 1
             save_last_index(current_idx)
 
-            time.sleep(0.4)
+            time.sleep(0.45)  # граничный лимит, без него может забанить
 
         if prob_list and iteration % 3 == 0:
             top5 = sorted(prob_list, key=lambda x: x[1], reverse=True)[:5]
@@ -387,7 +388,7 @@ def main_loop():
             bot.send_message(CHAT_ID, top_text)
             print("Топ-5 отправлен")
 
-        print(f"[{now_str}] Итерация завершена | просканировано {scanned} | уведомлений: {high_prob_count}")
+        print(f"[{now_str}] Итерация завершена | просканировано {scanned} | уведомлений: {high_prob_count} → сразу следующая")
 
         if time.time() - last_funding_check > 1800:
             for s in ACTIVE_SIGNALS[:]:
@@ -398,7 +399,7 @@ def main_loop():
                     pass
             last_funding_check = time.time()
 
-        time.sleep(INTERVAL_SECONDS)
+        # НЕТ time.sleep — непрерывный цикл
 
 
 if __name__ == '__main__':

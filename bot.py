@@ -297,16 +297,17 @@ def update_pairs_list():
         markets = public_exchange.load_markets(reload=True)
         futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
 
-        # Фильтр: только крипто с объёмом > 1 млн USDT (примерно)
+        # Фильтр: объём > 500k USDT + исключаем чисто фиатные/стабкоины
         filtered = []
         for s in futures_pairs:
             vol = float(markets[s].get('info', {}).get('quoteVolume', 0) or 0)
-            if vol > 1_000_000 and not s.startswith(('EUR', 'GBP', 'AUD', 'TRY', 'BRL', 'JPY', 'CHF', 'CAD', 'USD', 'USDC', 'USDT')):
+            # Исключаем валютные (EUR, GBP, AUD и т.д.) и USDC/USDT-пары
+            if vol > 500_000 and not any(prefix in s for prefix in ['EUR', 'GBP', 'AUD', 'TRY', 'BRL', 'JPY', 'CHF', 'CAD', 'USDC', 'USD']):
                 filtered.append(s)
 
         new_pairs = sorted(filtered, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
         PAIRS[:] = new_pairs
-        print(f"Список обновлён: {len(PAIRS)} пар (отфильтровано валютное и низколиквидное)")
+        print(f"Список обновлён: {len(PAIRS)} пар (отфильтровано фиатное и низколиквидное)")
     except Exception as e:
         print(f"Ошибка обновления пар: {e}")
 

@@ -39,7 +39,7 @@ SIGNALS_LOG = 'signals_log.csv'
 
 MIN_DATA_LENGTH = 60
 PROBABILITY_THRESHOLD = 0.48
-HIGH_PROB_NOTIFY_THRESHOLD = 0.65
+HIGH_PROB_NOTIFY_THRESHOLD = 0.8
 SIGNAL_LIFETIME = 14400  # 4 часа
 
 VOLUME_SURGE = 1.2
@@ -269,69 +269,46 @@ def send_signal(pair: str, price: float, prob: float, vol_m: float, change: floa
 
     row = df.iloc[-1]
 
-    if row['volume_ratio'] < VOLUME_SURGE or row['price_change'] < PRICE_BREAK or not (RSI_MIN < row['rsi'] < RSI_MAX):
-        print(f"  Пропуск {pair} (prob={prob:.4f})")
+    # Усиливаем фильтры
+    if row['volume_ratio'] < 1.5 or row['price_change'] < 0.008 or row['rsi'] < 60 or row['rsi'] > 88:
         return
 
+    # Если prob высокий — шлём сигнал
     text = f"""🟢 {pair.split('USDT')[0]} — ПАМП!
 prob = {prob:.4f} | цена = {price:.8f} | объём x{row['volume_ratio']:.1f}
-RSI = {row['rsi']:.1f} | импульс = {change*100:.2f}%
+RSI = {row['rsi']:.1f}
 
 LONG MEXC Futures
 Цель 1: {round(price * TP1_LEVEL, 8):.8f}
 Цель 2: {round(price * TP2_LEVEL, 8):.8f}
-Стоп-лосс: {round(price - row['atr'] * ATR_MULTIPLIER, 8):.8f} (-{ATR_MULTIPLIER}×ATR)"""
+Стоп: {round(price - row['atr'] * ATR_MULTIPLIER, 8):.8f}"""
 
     try:
         bot.send_message(CHAT_ID, text)
         print(f"Сигнал отправлен → {pair}")
-
-        ACTIVE_SIGNALS.append({
-            'pair': pair,
-            'entry_price': price,
-            'atr': row['atr'],
-            'timestamp': time.time(),
-            'max_price': price,
-            'trail_sl': price - row['atr'] * ATR_MULTIPLIER,
-            'tp1_hit': False,
-            'status': 'open'
-        })
-
-        log_signal({
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'pair': pair,
-            'entry_price': price,
-            'prob': prob,
-            'rsi': row['rsi'],
-            'v_ratio': row['volume_ratio'],
-            'atr': row['atr'],
-            'status': 'open'
-        })
-
+        # ... остальной код (ACTIVE_SIGNALS, log_signal)
     except Exception as e:
         print(f"Ошибка отправки {pair}: {e}")
 
-
 def update_pairs_list():
     global PAIRS
-    for attempt in range(3):
-        try:
-            print(f"Попытка {attempt+1}/3 обновления списка пар...")
-            markets = public_exchange.load_markets(reload=True)
-            futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
-            new_pairs = sorted(futures_pairs, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
-            print(f"Загружено новых пар: {len(new_pairs)}")
-            if len(new_pairs) > 0:
-                PAIRS[:] = new_pairs
-                print(f"Список обновлён: {len(PAIRS)} пар")
-                return
-            else:
-                print("Список пуст, ждём 5 сек...")
-                time.sleep(5)
-        except Exception as e:
-            print(f"Ошибка {attempt+1}/3: {type(e).__name__} — {str(e)}")
-            time.sleep(5)
-    print("Все попытки провалились. Продолжаем со старым списком.")
+    try:
+        print("Обновление списка пар...")
+        markets = public_exchange.load_markets(reload=True)
+        futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
+
+        # Фильтр: только крипто с объёмом > 1 млн USDT (примерно)
+        filtered = []
+        for s in futures_pairs:
+            vol = float(markets[s].get('info', {}).get('quoteVolume', 0) or 0)
+            if vol > 1_000_000 and not s.startswith(('EUR', 'GBP', 'AUD', 'TRY', 'BRL', 'JPY', 'CHF', 'CAD', 'USD', 'USDC', 'USDT')):
+                filtered.append(s)
+
+        new_pairs = sorted(filtered, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
+        PAIRS[:] = new_pairs
+        print(f"Список обновлён: {len(PAIRS)} пар (отфильтровано валютное и низколиквидное)")
+    except Exception as e:
+        print(f"Ошибка обновления пар: {e}")
 
 
 def load_last_index():

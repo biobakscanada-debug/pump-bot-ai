@@ -297,19 +297,20 @@ def update_pairs_list():
         markets = public_exchange.load_markets(reload=True)
         futures_pairs = [s for s, m in markets.items() if m.get('swap') and 'USDT' in s and m.get('active')]
 
-        # Фильтр: объём > 500k USDT + исключаем чисто фиатные/стабкоины
-        filtered = []
-        for s in futures_pairs:
-            vol = float(markets[s].get('info', {}).get('quoteVolume', 0) or 0)
-            # Исключаем валютные (EUR, GBP, AUD и т.д.) и USDC/USDT-пары
-            if vol > 500_000 and not any(prefix in s for prefix in ['EUR', 'GBP', 'AUD', 'TRY', 'BRL', 'JPY', 'CHF', 'CAD', 'USDC', 'USD']):
-                filtered.append(s)
+        # Мягкий фильтр: исключаем только очевидные фиатные/стабкоины
+        # Объём не проверяем строго, потому что API иногда возвращает 0
+        excluded_prefixes = ['EUR', 'GBP', 'AUD', 'TRY', 'BRL', 'JPY', 'CHF', 'CAD', 'USDC', 'USD', 'USDT/USDT']
+        filtered = [s for s in futures_pairs if not any(s.startswith(prefix) for prefix in excluded_prefixes)]
 
+        # Сортировка по объёму (если 0 — всё равно добавляем)
         new_pairs = sorted(filtered, key=lambda s: float(markets[s].get('info', {}).get('quoteVolume', 0) or 0), reverse=True)
+
         PAIRS[:] = new_pairs
-        print(f"Список обновлён: {len(PAIRS)} пар (отфильтровано фиатное и низколиквидное)")
+        print(f"Список обновлён: {len(PAIRS)} пар (исключено фиатное/стабкоин)")
+        print(f"Первые 5 пар: {PAIRS[:5]}")  # для отладки
     except Exception as e:
         print(f"Ошибка обновления пар: {e}")
+        # Если ошибка — оставляем старый список
 
 
 def load_last_index():

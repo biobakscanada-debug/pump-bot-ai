@@ -24,7 +24,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🚀 Pump Hunter — реальный инструмент!"
+    return "Pump Hunter работает!"
 
 @app.route('/ping')
 def ping():
@@ -32,25 +32,25 @@ def ping():
 
 # Константы
 TIMEFRAME = '1h'
-MODEL_FILE = 'catboost_pump_real.cbm'
+MODEL_FILE = 'catboost_pump_anonymous.cbm'  # новое имя модели
 LAST_INDEX_FILE = 'last_pair_index.txt'
-DATASET_FILE = 'pump_dataset.csv'
+DATASET_FILE = 'pump_dataset_anonymous.csv'
 SIGNALS_LOG = 'signals_log.csv'
 
 MIN_DATA_LENGTH = 60
-PROBABILITY_THRESHOLD = 0.35
-HIGH_PROB_NOTIFY_THRESHOLD = 0.40
+PROBABILITY_THRESHOLD = 0.48
+HIGH_PROB_NOTIFY_THRESHOLD = 0.65
 SIGNAL_LIFETIME = 14400  # 4 часа
 
 VOLUME_SURGE = 1.2
 PRICE_BREAK = 0.005
 RSI_MIN = 40
 RSI_MAX = 90
-ATR_MULTIPLIER = 3.0  # твой выбор
+ATR_MULTIPLIER = 3.0
 
-TP1_LEVEL = 1.08  # +8%
-TP2_LEVEL = 1.15  # +15%
-TRAIL_AFTER_TP1 = 1.03  # +3% после TP1
+TP1_LEVEL = 1.08   # +8%
+TP2_LEVEL = 1.15   # +15%
+TRAIL_AFTER_TP1 = 1.03
 
 FEATURES = ['ema200', 'rsi', 'macd', 'bb_width', 'price_change', 'volume_change', 'volume_ratio']
 
@@ -70,11 +70,12 @@ private_exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap', 'adjustForTimeDifference': True, 'recvWindow': 15000}
+    'options': {'defaultType': 'swap'},
 })
 
 PAIRS = []
-ACTIVE_SIGNALS = []  # для отслеживания открытых сигналов
+ACTIVE_SIGNALS = []
+last_report_time = time.time()
 
 
 def fetch_ohlcv(symbol: str, limit: int = 1500):
@@ -84,10 +85,6 @@ def fetch_ohlcv(symbol: str, limit: int = 1500):
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
-    except ccxt.RateLimitExceeded:
-        print(f"Rate limit на {symbol}, ждём 5 сек")
-        time.sleep(5)
-        return fetch_ohlcv(symbol, limit)
     except Exception as e:
         print(f"Ошибка загрузки {symbol}: {e}")
         return pd.DataFrame()
@@ -126,30 +123,33 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_or_train_model():
     if os.path.exists(MODEL_FILE):
-        print("Загружаем существующую модель...")
+        print("Загружаем анонимную модель...")
         model = CatBoostClassifier()
         model.load_model(MODEL_FILE)
         return model
 
     if not os.path.exists(DATASET_FILE):
-        print(f"Файл датасета {DATASET_FILE} не найден! Обучение невозможно.")
+        print(f"Файл {DATASET_FILE} не найден!")
         return None
 
-    print(f"Загружаем датасет из {DATASET_FILE}...")
-    try:
-        df_all = pd.read_csv(DATASET_FILE)
-        if df_all.empty:
-            print("Датасет пуст!")
-            return None
-    except Exception as e:
-        print(f"Ошибка чтения датасета: {e}")
+    print(f"Обучение на анонимном датасете {DATASET_FILE}...")
+    df_all = pd.read_csv(DATASET_FILE)
+    if df_all.empty:
+        print("Датасет пуст!")
         return None
 
     X = df_all[FEATURES]
     y = df_all['target']
 
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = CatBoostClassifier(iterations=1200, depth=8, learning_rate=0.04, verbose=0)
+    model = CatBoostClassifier(
+        iterations=600,
+        depth=5,
+        learning_rate=0.06,
+        l2_leaf_reg=3,
+        random_strength=0.8,
+        verbose=0
+    )
     model.fit(X_tr, y_tr)
 
     acc = accuracy_score(y_te, model.predict(X_te))
@@ -157,6 +157,159 @@ def load_or_train_model():
 
     model.save_model(MODEL_FILE)
     return model
+
+
+def get_market_data(symbol):
+    try:
+        ticker = public_exchange.fetch_ticker(symbol)
+        return ticker['last'], ticker.get('percentage', 0), round(ticker.get('quoteVolume', 0) / 1_000_000, 1)
+    except Exception as e:
+        print(f"Ошибка get_market_data {symbol}: {e}")
+        return 0.0, 0.0, 0.0
+
+
+def log_signal(signal_data):
+    file_exists = os.path.exists(SIGNALS_LOG)
+    with open(SIGNALS_LOG, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=signal_data.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(signal_data)
+
+
+def check_signals_status():
+    now = time.time()
+    to_remove = []
+    report = []
+
+    for s in ACTIVE_SIGNALS:
+        pair = s['pair']
+        entry = s['entry_price']
+        atr = s['atr']
+        max_price = s.get('max_price', entry)
+        trail_sl = s.get('trail_sl', entry - atr * ATR_MULTIPLIER)
+        tp1_hit = s.get('tp1_hit', False)
+
+        try:
+            price, _, _ = get_market_data(pair)
+            if price <= 0:
+                continue
+
+            if price > max_price:
+                s['max_price'] = price
+                new_sl = price - atr * ATR_MULTIPLIER
+                if new_sl > trail_sl:
+                    s['trail_sl'] = new_sl
+
+            if not tp1_hit and price >= entry * TP1_LEVEL:
+                s['tp1_hit'] = True
+                s['trail_sl'] = entry * TRAIL_AFTER_TP1
+                report.append(f"TP1 достигнут: {pair} | {price:.8f}")
+
+            if price >= entry * TP2_LEVEL:
+                report.append(f"TP2 достигнут: {pair} | {price:.8f}")
+                to_remove.append(s)
+                continue
+
+            if price <= trail_sl:
+                report.append(f"SL сработал: {pair} | {price:.8f}")
+                to_remove.append(s)
+                continue
+
+            if now - s['timestamp'] > SIGNAL_LIFETIME:
+                report.append(f"Тайм-аут: {pair} | {price:.8f}")
+                to_remove.append(s)
+                continue
+
+        except Exception as e:
+            print(f"Ошибка проверки {pair}: {e}")
+
+    for s in to_remove:
+        ACTIVE_SIGNALS.remove(s)
+
+    if report:
+        bot.send_message(CHAT_ID, "\n".join(report))
+
+
+def daily_report():
+    global last_report_time
+    now = time.time()
+    if now - last_report_time < 86400:
+        return
+
+    if not os.path.exists(SIGNALS_LOG):
+        return
+
+    df = pd.read_csv(SIGNALS_LOG)
+    if df.empty:
+        return
+
+    total = len(df)
+    tp_hit = len(df[df['status'].str.contains('tp', na=False)])
+    sl_hit = len(df[df['status'] == 'sl_hit'])
+    timeout = len(df[df['status'] == 'timeout'])
+    winrate = tp_hit / total * 100 if total > 0 else 0
+
+    text = f"""📊 Отчёт за 24 часа (PUMP)
+Всего сигналов: {total}
+TP достигнуто: {tp_hit} ({winrate:.1f}%)
+SL сработал: {sl_hit}
+Тайм-аут: {timeout}
+Активных позиций: {len(ACTIVE_SIGNALS)}"""
+
+    bot.send_message(CHAT_ID, text)
+    last_report_time = now
+
+
+def send_signal(pair: str, price: float, prob: float, vol_m: float, change: float):
+    df = fetch_ohlcv(pair)
+    if df.empty: return
+    df = add_features(df)
+    if df.empty: return
+
+    row = df.iloc[-1]
+
+    if row['volume_ratio'] < VOLUME_SURGE or row['price_change'] < PRICE_BREAK or not (RSI_MIN < row['rsi'] < RSI_MAX):
+        print(f"  Пропуск {pair} (prob={prob:.4f})")
+        return
+
+    text = f"""🟢 {pair.split('USDT')[0]} — ПАМП!
+prob = {prob:.4f} | цена = {price:.8f} | объём x{row['volume_ratio']:.1f}
+RSI = {row['rsi']:.1f} | импульс = {change*100:.2f}%
+
+LONG MEXC Futures
+Цель 1: {round(price * TP1_LEVEL, 8):.8f}
+Цель 2: {round(price * TP2_LEVEL, 8):.8f}
+Стоп-лосс: {round(price - row['atr'] * ATR_MULTIPLIER, 8):.8f} (-{ATR_MULTIPLIER}×ATR)"""
+
+    try:
+        bot.send_message(CHAT_ID, text)
+        print(f"Сигнал отправлен → {pair}")
+
+        ACTIVE_SIGNALS.append({
+            'pair': pair,
+            'entry_price': price,
+            'atr': row['atr'],
+            'timestamp': time.time(),
+            'max_price': price,
+            'trail_sl': price - row['atr'] * ATR_MULTIPLIER,
+            'tp1_hit': False,
+            'status': 'open'
+        })
+
+        log_signal({
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'pair': pair,
+            'entry_price': price,
+            'prob': prob,
+            'rsi': row['rsi'],
+            'v_ratio': row['volume_ratio'],
+            'atr': row['atr'],
+            'status': 'open'
+        })
+
+    except Exception as e:
+        print(f"Ошибка отправки {pair}: {e}")
 
 
 def update_pairs_list():
@@ -178,7 +331,7 @@ def update_pairs_list():
         except Exception as e:
             print(f"Ошибка {attempt+1}/3: {type(e).__name__} — {str(e)}")
             time.sleep(5)
-    print("Все попытки провалились. Продолжаем со старым списком (если был).")
+    print("Все попытки провалились. Продолжаем со старым списком.")
 
 
 def load_last_index():
@@ -204,38 +357,14 @@ def save_last_index(idx):
         print(f"Ошибка сохранения индекса: {e}")
 
 
-def check_expired_signals():
-    global ACTIVE_SIGNALS
-    now = time.time()
-    to_remove = []
-    for s in ACTIVE_SIGNALS:
-        if now - s['timestamp'] > SIGNAL_LIFETIME:
-            try:
-                price, _, _ = get_market_data(s['pair'])
-                msg = f"✅ {s['pair']} отработал!" if price > s['entry_price'] else f"⚠️ {s['pair']} тайм-аут"
-                bot.send_message(CHAT_ID, msg)
-            except:
-                pass
-            to_remove.append(s)
-    ACTIVE_SIGNALS = [s for s in ACTIVE_SIGNALS if s not in to_remove]
-
-
-def get_market_data(symbol):
-    try:
-        ticker = public_exchange.fetch_ticker(symbol)
-        return ticker['last'], ticker.get('percentage', 0), round(ticker.get('quoteVolume', 0) / 1_000_000, 1)
-    except:
-        return 0.0, 0.0, 0.0
-
-
 def main_loop():
     model = load_or_train_model()
     if model is None:
-        print("Модель не загружена — работаем без модели")
+        print("Модель не загружена")
     else:
         print("Модель готова")
 
-    bot.send_message(CHAT_ID, f"🚀 Pump Hunter запущен — журнал в CSV | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    bot.send_message(CHAT_ID, f"🚀 Pump Hunter запущен (анонимный датасет, prob > {PROBABILITY_THRESHOLD})")
 
     iteration = 0
     last_funding_check = time.time()
@@ -246,85 +375,60 @@ def main_loop():
         print(f"[{now_str}] Итерация {iteration} | пар: {len(PAIRS)}")
 
         update_pairs_list()
-        check_expired_signals()
+        check_signals_status()
+        daily_report()
 
         if len(PAIRS) == 0:
-            print("Список пар пуст! Пытаемся обновить...")
             update_pairs_list()
-            if len(PAIRS) == 0:
-                print("Обновление не удалось. Ждём 60 сек и пробуем снова.")
-                time.sleep(60)
-                continue
+            time.sleep(60)
+            continue
 
         start_idx = load_last_index()
         if start_idx >= len(PAIRS):
-            print(f"Индекс {start_idx} > длины списка {len(PAIRS)} — сбрасываем на 0")
             start_idx = 0
             save_last_index(0)
 
-        print(f"[{now_str}] Продолжаем с индекса {start_idx}")
-
         scanned = 0
-        high_prob_count = 0
         prob_list = []
 
-        for i, pair in enumerate(PAIRS[start_idx:]):
+        for pair in PAIRS[start_idx:]:
             scanned += 1
             try:
                 df = fetch_ohlcv(pair)
-                if len(df) < MIN_DATA_LENGTH:
-                    print(f"  {pair:20} → мало данных")
-                    continue
                 df = add_features(df)
-                if df.empty:
-                    print(f"  {pair:20} → фичи не посчитались")
-                    continue
+                if len(df) < MIN_DATA_LENGTH: continue
 
                 row = df.iloc[-1]
                 feats = row[FEATURES].values.reshape(1, -1)
-                prob = model.predict_proba(feats)[0][1] if model is not None else 0.0
+                prob = model.predict_proba(feats)[0][1]
 
-                print(f"  {pair:20} → prob={prob:.4f} | RSI={row['rsi']:.1f} | v_ratio={row['volume_ratio']:.1f}")
+                print(f"{pair:20} → prob={prob:.4f} | RSI={row['rsi']:.1f} | v_ratio={row['volume_ratio']:.1f}")
 
                 if prob > HIGH_PROB_NOTIFY_THRESHOLD:
-                    high_prob_count += 1
-                    msg = f"🔥 Высокая вероятность: {pair}\nprob = {prob:.4f}\nRSI = {row['rsi']:.1f}\nv_ratio = {row['volume_ratio']:.1f}"
-                    try:
-                        bot.send_message(CHAT_ID, msg)
-                        print(f"  Уведомление: {pair}")
-                    except Exception as e:
-                        print(f"  Ошибка уведомления {pair}: {e}")
+                    bot.send_message(CHAT_ID, f"🔥 Высокая вероятность: {pair}\nprob = {prob:.4f}\nRSI = {row['rsi']:.1f}\nv_ratio = {row['volume_ratio']:.1f}")
+
+                if prob > 0.40:
+                    print(f"   >>> Близко к сигналу: prob = {prob:.4f} <<<")
+
+                if prob > PROBABILITY_THRESHOLD:
+                    price, ch, vm = get_market_data(pair)
+                    send_signal(pair, price, prob, vm, row['price_change'])
 
                 prob_list.append((pair, prob, row['rsi'], row['volume_ratio']))
 
-                if prob > PROBABILITY_THRESHOLD:
-                    price, _, vm = get_market_data(pair)
-                    atr = row['atr']
-                    send_signal(pair, price, prob, vm, row['price_change'], atr)
-
             except Exception as e:
-                print(f"  {pair} → ошибка: {type(e).__name__}")
-
-            if scanned % 50 == 0:
-                print(f"  Прогресс: {scanned}/{len(PAIRS)} | {pair}")
-
-            current_idx = start_idx + i + 1
-            save_last_index(current_idx)
+                print(f"Ошибка {pair}: {e}")
 
             time.sleep(0.45)
 
-        if prob_list and iteration % 3 == 0:
+        if prob_list:
             top5 = sorted(prob_list, key=lambda x: x[1], reverse=True)[:5]
             top_text = f"Топ-5 за итерацию {iteration}:\n"
-            for pair, prob, rsi, vratio in top5:
-                top_text += f"{pair}: prob={prob:.4f} | RSI={rsi:.1f} | v_ratio={vratio:.1f}\n"
-            try:
-                bot.send_message(CHAT_ID, top_text)
-                print("Топ-5 отправлен")
-            except:
-                print("Ошибка отправки топ-5")
+            for p, pr, r, v in top5:
+                top_text += f"{p}: prob={pr:.4f} | RSI={r:.1f} | v_ratio={v:.1f}\n"
+            bot.send_message(CHAT_ID, top_text)
 
-        print(f"[{now_str}] Итерация завершена | просканировано {scanned} | уведомлений: {high_prob_count} → сразу следующая")
+        print(f"[{now_str}] Итерация завершена | просканировано {scanned}")
 
         if time.time() - last_funding_check > 1800:
             for s in ACTIVE_SIGNALS[:]:
